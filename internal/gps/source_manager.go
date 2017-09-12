@@ -27,6 +27,26 @@ import (
 // Used to compute a friendly filepath from a URL-shaped input.
 var sanitizer = strings.NewReplacer("-", "--", ":", "-", "/", "-", "+", "-")
 
+type Locker interface {
+	TryLock() error
+	Unlock() error
+	GetOwner() (*os.Process, error)
+}
+
+type FalseLocker struct{}
+
+func (fl FalseLocker) GetOwner() (*os.Process, error) {
+	return nil, fmt.Errorf("FalseLocker always fails.")
+}
+
+func (fl FalseLocker) TryLock() error {
+	return nil
+}
+
+func (fl FalseLocker) Unlock() error {
+	return nil
+}
+
 // A SourceManager is responsible for retrieving, managing, and interrogating
 // source repositories. Its primary purpose is to serve the needs of a Solver,
 // but it is handy for other purposes, as well.
@@ -114,8 +134,9 @@ func (p ProjectAnalyzerInfo) String() string {
 // There's no (planned) reason why it would need to be reimplemented by other
 // tools; control via dependency injection is intended to be sufficient.
 type SourceMgr struct {
-	cachedir    string                // path to root of cache dir
-	lf          *lockfile.Lockfile    // handle for the sm lock file on disk
+	cachedir string // path to root of cache dir
+	// lf          *lockfile.Lockfile    // handle for the sm lock file on disk
+	lf          Locker                // handle for the sm lock file on disk
 	suprvsr     *supervisor           // subsystem that supervises running calls/io
 	cancelAll   context.CancelFunc    // cancel func to kill all running work
 	deduceCoord *deductionCoordinator // subsystem that manages import path deduction
@@ -136,8 +157,9 @@ var _ SourceManager = &SourceMgr{}
 
 // SourceManagerConfig holds configuration information for creating SourceMgrs.
 type SourceManagerConfig struct {
-	Cachedir string      // Where to store local instances of upstream sources.
-	Logger   *log.Logger // Optional info/warn logger. Discards if nil.
+	Cachedir       string      // Where to store local instances of upstream sources.
+	Logger         *log.Logger // Optional info/warn logger. Discards if nil.
+	DisableLocking bool        // Disable file locking.
 }
 
 // NewSourceManager produces an instance of gps's built-in SourceManager.
@@ -169,7 +191,14 @@ func NewSourceManager(c SourceManagerConfig) (*SourceMgr, error) {
 	// we can spin on.
 
 	glpath := filepath.Join(c.Cachedir, "sm.lock")
-	lockfile, err := lockfile.New(glpath)
+
+	lockfile, err := func() (Locker, error) {
+		if c.DisableLocking {
+			return FalseLocker{}, nil
+		}
+		return lockfile.New(glpath)
+	}()
+
 	if err != nil {
 		return nil, CouldNotCreateLockError{
 			Path: glpath,
@@ -232,7 +261,7 @@ func NewSourceManager(c SourceManagerConfig) (*SourceMgr, error) {
 
 	sm := &SourceMgr{
 		cachedir:    c.Cachedir,
-		lf:          &lockfile,
+		lf:          lockfile,
 		suprvsr:     superv,
 		cancelAll:   cf,
 		deduceCoord: deducer,
